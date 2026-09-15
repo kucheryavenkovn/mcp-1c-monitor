@@ -555,7 +555,7 @@ async function mode(key,which){
 async function logs(key,title){
   const cname=CNAME[key]||key;
   const r=await fetch(`/api/logs/${cname}?tail=80`);
-  document.getElementById('biglog').textContent='=== '+cname+' ===\n'+await r.text();
+  document.getElementById('biglog').textContent='=== '+cname+' ===\\n'+await r.text();
 }
 async function dataPanel(key){
   const box=document.getElementById('data-'+key);
