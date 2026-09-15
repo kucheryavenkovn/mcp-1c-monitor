@@ -694,6 +694,7 @@ async function loadData(key){
   box.innerHTML='диск…';
   const d=await (await fetch(`/api/data/${key}`)).json();
   let html='';
+  if(key==='graphbeta'){html+=`<div class="row"><a href="/metadata" style="color:#7cc7ff"><b>Просмотрщик метаданных: справочники, документы, слои базы и расширения →</b></a></div>`;}
   (d.disk||[]).forEach(x=>{html+=`<div class="row">Диск ${x.path.replace(/</g,'&lt;')}: <b>${x.mb??'?'} МБ</b></div>`;});
   html+='<div id="statrows"></div>';
   const acts={"reindex":"переиндексировать (фон)","refresh_layers":"перечитать слои расширений (долго!)","delete_project":"удалить граф-проект…"};
