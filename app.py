@@ -507,8 +507,11 @@ const showBox=document.getElementById('showdead'),hiddenBox=document.getElementB
 showBox.checked=localStorage.getItem('mcpmon_showdead')==='1';
 showBox.onchange=()=>{localStorage.setItem('mcpmon_showdead',showBox.checked?'1':'0');refresh();};
 async function refresh(){
-  gpuRefresh();
-  const r=await fetch('/api/status');const j=await r.json();
+  try{
+    await gpuRefresh();
+    const r=await fetch('/api/status');
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const j=await r.json();
   ts.textContent='обновлено '+new Date(j.ts*1000).toLocaleTimeString();
   const vis=j.servers.filter(s=>showBox.checked||!['stopped','missing'].includes(s.state));
   hiddenBox.textContent=showBox.checked?'':('скрыто остановленных: '+(j.servers.length-vis.length));
@@ -534,6 +537,9 @@ async function refresh(){
     ${s.has_data?`<div class="logline" id="data-${s.key}" style="display:none">…</div>`:''}</div>`}).join('');
   const lb=document.getElementById('logbtns');
   if(!lb.children.length){lb.innerHTML=j.servers.map(s=>`<button onclick="logs('${s.key}','${s.name}')">${s.name}</button>`).join('');}
+  }catch(e){
+    document.getElementById('grid').innerHTML=`<div class="card"><div class="row">Нет связи с монитором (${String(e).slice(0,100)}). Проверьте контейнер mcp_1c_monitor, страница повторит сама.</div></div>`;
+  }
 }
 const CNAME={help:'1c_help_mcp',graph:'1c_graph_metadata',codemeta:'1c_code_metadata_mcp',ssl:'1c_ssl_mcp',templates:'1c_templates_mcp',syntax:'1c_syntaxcheck_mcp',checker:'1c_code_checker',neo4j:'neo4j',graphbeta:'1c_graph_metadata_beta',neo4jbeta:'neo4j_beta'};
 async function ctl(key,action){
@@ -594,7 +600,9 @@ refresh();setInterval(refresh,5000);
 
 @app.get("/")
 def index():
-    return Response(PAGE, mimetype="text/html")
+    # Без кеша: иначе вкладка, открытая во время пересборки, висит с битой версией.
+    return Response(PAGE, mimetype="text/html",
+                    headers={"Cache-Control": "no-store, max-age=0"})
 
 
 if __name__ == "__main__":
