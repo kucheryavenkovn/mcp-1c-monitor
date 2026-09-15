@@ -79,9 +79,13 @@ RUN_SPECS = {
                  "lic_env": "LICENSE_KEY_CODEMETADATA", "port": 8000,
                  "env": {"METADATA_PATH": "/app/code", "CODE_PATH": "/app/code",
                          "SOURCE_FORMAT": "auto", "RESET_CACHE": "false",
-                         "RESET_DATABASE": "false", "USESSE": "false",
-                         "PARSE_WORKERS": "16", "EMBEDDING_CONCURRENCY": "10",
-                         "EMBED_BATCH_SIZE_LOCAL": "128", "SUB_INDEX_WORKERS": "8"},
+                         "RESET_DATABASE": "false", "USESSE": "false"},
+                 # Профили параллелизма: на CPU большой батч только вредит
+                 # (RAM и скорость), на GPU — наоборот.
+                 "gpu_env": {"PARSE_WORKERS": "16", "EMBEDDING_CONCURRENCY": "10",
+                             "EMBED_BATCH_SIZE_LOCAL": "256", "SUB_INDEX_WORKERS": "8"},
+                 "cpu_env": {"PARSE_WORKERS": "16", "EMBEDDING_CONCURRENCY": "10",
+                             "EMBED_BATCH_SIZE_LOCAL": "32", "SUB_INDEX_WORKERS": "8"},
                  "binds": [("PATH_CODE", "/app/code", "ro"),
                            (("PATH_BASES", "mcp_codemetadata"), "/app/chroma_db", "rw")]},
 }
@@ -94,7 +98,7 @@ def resolve_bind(expr):
     return ENV(expr, "")
 
 
-def recreate(key, use_gpu):
+def recreate(key, use_gpu, extra=None):
     """Пересоздать контейнер сервера с GPU или без. Индексы живут в томах."""
     spec = RUN_SPECS[key]
     lic = ENV(spec["lic_env"], "")
@@ -103,6 +107,11 @@ def recreate(key, use_gpu):
     env = {"LICENSE_KEY": lic}
     for k, v in spec["env"].items():
         env[k] = ENV(v[1], "") if isinstance(v, tuple) else v
+    # Профиль режима: GPU и CPU различаются (батч и потоки).
+    for k, v in spec.get("gpu_env" if use_gpu else "cpu_env", {}).items():
+        env[str(k)] = str(v)
+    for k, v in (extra or {}).items():
+        env[str(k)] = str(v)
     volumes, missing = {}, []
     for src_expr, dst, mode in spec["binds"]:
         # Пути Windows-хоста: внутри Linux-контейнера их не проверить,
