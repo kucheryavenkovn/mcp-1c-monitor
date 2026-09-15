@@ -181,7 +181,12 @@ def parse_mcp_payloads(text):
 
 def mcp_call(port, tool, args, timeout=90):
     """Вызов MCP-инструмента: initialize -> tools/call. Возвращает текст результата."""
-    import uuid as _uuid
+    r = mcp_result(port, tool, args, timeout)
+    return r["text"]
+
+
+def mcp_result(port, tool, args, timeout=90):
+    """То же, но сырым конвертом результата (dict)."""
     url = f"http://host.docker.internal:{port}/mcp"
     h = {"Content-Type": "application/json",
          "Accept": "application/json, text/event-stream"}
@@ -203,9 +208,11 @@ def mcp_call(port, tool, args, timeout=90):
         r2 = s.post(url, headers=h2, timeout=timeout,
                     json={"jsonrpc": "2.0", "id": 2, "method": "tools/call",
                           "params": {"name": tool, "arguments": args or {}}})
-        texts = []
+        texts, data = [], None
         for p in parse_mcp_payloads(r2.text):
             res = p.get("result", {})
+            if res:
+                data = res
             for c in res.get("content", []) or []:
                 if isinstance(c, dict) and c.get("text"):
                     texts.append(str(c["text"]))
@@ -214,10 +221,21 @@ def mcp_call(port, tool, args, timeout=90):
                                         ensure_ascii=False)[:4000])
             if p.get("error") and not texts:
                 texts.append("ERROR: " + json.dumps(p["error"], ensure_ascii=False)[:500])
+        # Контракт 2.0 графа: content.text — сам JSON-конверт (total/cursor/items).
+        # Распаковываем, иначе regex бежит по строке без настоящих переводов строк.
+        if texts:
+            try:
+                inner = json.loads(texts[0])
+                if isinstance(inner, dict) and ("text" in inner or "items" in inner):
+                    data = inner
+                    if isinstance(inner.get("text"), str):
+                        texts[0] = inner["text"]
+            except Exception:
+                pass
         body = "\n".join(texts) if texts else r2.text[:2000]
-        return {"ok": True, "text": body[:4000]}
+        return {"ok": True, "text": body[:4000], "data": data}
     except Exception as e:
-        return {"ok": False, "text": str(e)[:300]}
+        return {"ok": False, "text": str(e)[:300], "data": None}
 
 
 def du_mb(container, path):
@@ -282,6 +300,82 @@ def api_action(key, action):
                                  "operation_id": _uuid.uuid4().hex[:12]},
                                 timeout=120))
     return jsonify({"ok": False, "text": "unknown action"}), 400
+
+
+# --- Просмотрщик метаданных графа (base/слои расширений) ---
+META_CATS = ["Справочники", "Документы", "РегистрыСведений",
+             "РегистрыНакопления", "Перечисления", "Отчеты", "Обработки",
+             "Константы", "ОбщиеМодули", "Роли", "ПодпискиНаСобытия",
+             "БизнесПроцессы", "Задачи", "ЖурналыДокументов"]
+OBJ_RE = re.compile(r"object_name:\s*(.+?)\s*$", re.M)
+
+
+def g_template(op, params, extra=None):
+    q = json.dumps({"operation": op, **params}, ensure_ascii=False)
+    args = {"query": q}
+    if extra:
+        args.update(extra)
+    return mcp_result(8106, "search_metadata", args, timeout=120)
+
+
+@app.get("/api/meta/cats")
+def api_meta_cats():
+    out = []
+    for c in META_CATS:
+        r = g_template("list_objects_by_category", {"category_name": c},
+                       {"max_items": 1})
+        total = (r.get("data") or {}).get("total", 0) if r.get("ok") else 0
+        out.append({"name": c, "total": total})
+    return jsonify({"cats": out})
+
+
+@app.get("/api/meta/objects")
+def api_meta_objects():
+    cat = request.args.get("category", "")
+    q = request.args.get("q", "")
+    cursor = request.args.get("cursor", "")
+    limit = min(int(request.args.get("limit", "20")), 50)
+    if q:
+        params = {"object_name": q}
+        if cat:
+            params["category"] = cat
+        r = g_template("list_objects_by_name", params,
+                       {"max_items": limit, **({"cursor": cursor} if cursor else {})})
+    else:
+        r = g_template("list_objects_by_category", {"category_name": cat},
+                       {"max_items": limit, **({"cursor": cursor} if cursor else {})})
+    data = r.get("data") or {}
+    names = OBJ_RE.findall(r.get("text", ""))
+    return jsonify({"ok": r.get("ok"), "names": names,
+                    "total": data.get("total", len(names)),
+                    "cursor": data.get("cursor", "")})
+
+
+@app.get("/api/meta/object")
+def api_meta_object():
+    name = request.args.get("name", "")
+    if not name:
+        return jsonify({"error": "need name"}), 400
+    struct = g_template("object_structure", {"object_name": name})
+    eff = mcp_result(8106, "resolve_effective_entity", {"object_name": name})
+    layers, effective, extending = [], {}, []
+    try:
+        item = (eff.get("data") or {}).get("items", [])[0]
+        effective = item.get("effective", {}) or {}
+        extending = item.get("extending", []) or []
+        layers = ((eff.get("data") or {}).get("data", {}) or {}).get("layers", []) or []
+    except Exception:
+        pass
+    forms = g_template("list_forms", {"object_name": name})
+    return jsonify({
+        "name": name,
+        "structure": struct.get("text", "")[:3000],
+        "effective": {"layer": effective.get("layer", ""),
+                      "origin": effective.get("origin", "")},
+        "extending": [{"layer": e.get("layer", ""), "relation": e.get("relation", ""),
+                       "origin": e.get("origin", "")} for e in extending],
+        "layers": [{"layer": l.get("layer", ""), "kind": l.get("kind", "")} for l in layers],
+        "forms": forms.get("text", "")[:1200]})
 
 
 def dclient():
@@ -496,6 +590,7 @@ pre#biglog{background:#0c1220;border:1px solid #2a3450;border-radius:8px;padding
 </style></head><body>
 <h1>1C MCP — мониторинг флота</h1>
 <div class="sub">Docker + MCP-зонды + прогресс индексации из логов. Обновление каждые 5 с. <span id="ts"></span><br>
+<a href="/metadata" style="color:#7cc7ff">Просмотрщик метаданных базы и расширения →</a><br>
 <label><input type="checkbox" id="showdead"> показывать остановленные / legacy</label> <span id="hidden"></span></div>
 <h3>Видеокарта</h3>
 <div class="card" id="gpupanel">опрос NVML…</div>
@@ -613,6 +708,78 @@ refresh();setInterval(refresh,5000);
 def index():
     # Без кеша: иначе вкладка, открытая во время пересборки, висит с битой версией.
     return Response(PAGE, mimetype="text/html",
+                    headers={"Cache-Control": "no-store, max-age=0"})
+
+
+META_PAGE = """<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Метаданные конфигурации — просмотрщик</title>
+<style>
+body{font-family:system-ui,Segoe UI,Roboto,sans-serif;background:#0f1420;color:#e8ecf4;margin:0;padding:16px}
+a{color:#7cc7ff}.chips{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}
+.chip{background:#2a3450;border:1px solid #3a4670;border-radius:16px;padding:4px 12px;font-size:12px;cursor:pointer}
+.chip.on{background:#0b3d5c;border-color:#4da3ff}
+.chip small{color:#8b93a7}
+.cols{display:grid;grid-template-columns:minmax(280px,380px) 1fr;gap:12px}
+.panel{background:#1a2133;border:1px solid #2a3450;border-radius:10px;padding:12px}
+.orow{padding:6px 8px;border-radius:6px;cursor:pointer;font-size:13px}
+.orow:hover{background:#2a3450}
+.badge{display:inline-block;padding:2px 10px;border-radius:20px;font-size:12px;font-weight:600}
+.base{background:#0f5132;color:#7dffa8}.ext{background:#5a4100;color:#ffd76a}
+pre{background:#0c1220;border-radius:6px;padding:8px;font-size:12px;max-height:300px;overflow:auto;white-space:pre-wrap}
+input[type=text]{background:#0c1220;color:#e8ecf4;border:1px solid #3a4670;border-radius:6px;padding:6px 10px;font-size:13px;width:280px}
+button{background:#2a3450;color:#e8ecf4;border:1px solid #3a4670;border-radius:6px;padding:5px 12px;font-size:12px;cursor:pointer}
+</style></head><body>
+<h2>Метаданные: база и расширение</h2>
+<div><a href="/">назад к мониторингу</a> · проект <b>1C Metadata Project</b> (beta-контур :8106)</div>
+<div style="margin-top:8px"><input type="text" id="q" placeholder="поиск по имени…"> <button onclick="search()">найти</button></div>
+<div class="chips" id="chips"></div>
+<div class="cols"><div class="panel"><div id="count"></div><div id="list"></div><button id="more" style="display:none" onclick="more()">ещё</button></div>
+<div class="panel" id="detail">выберите объект слева…</div></div>
+<script>
+let cur={cat:'',q:'',cursor:''};
+async function cats(){
+  const j=await (await fetch('/api/meta/cats')).json();
+  document.getElementById('chips').innerHTML=j.cats.map(c=>
+    `<span class="chip" id="chip-${c.name}" onclick="pick('${c.name}')">${c.name} <small>${c.total}</small></span>`).join('');
+}
+async function pick(cat){
+  document.querySelectorAll('.chip').forEach(e=>e.classList.remove('on'));
+  const el=document.getElementById('chip-'+cat);if(el)el.classList.add('on');
+  cur={cat:cat,q:'',cursor:''};await load(true);
+}
+async function search(){cur={cat:'',q:document.getElementById('q').value,cursor:''};
+  document.querySelectorAll('.chip').forEach(e=>e.classList.remove('on'));await load(true);}
+async function load(fresh){
+  const p=new URLSearchParams({category:cur.cat,q:cur.q,limit:20,cursor:fresh?'':cur.cursor});
+  const j=await (await fetch('/api/meta/objects?'+p)).json();
+  cur.cursor=j.cursor||'';
+  document.getElementById('count').innerHTML='<b>'+j.total+'</b> объектов';
+  const html=j.names.map(n=>`<div class="orow" data-n="${n.replace(/"/g,'&quot;')}">${n.replace(/</g,'&lt;')}</div>`).join('');
+  const box=document.getElementById('list');
+  box.innerHTML=fresh?html:box.innerHTML+html;
+  box.querySelectorAll('.orow').forEach(e=>{e.onclick=()=>detail(e.getAttribute('data-n'));});
+  document.getElementById('more').style.display=j.cursor?'':'none';
+}
+async function more(){await load(false);}
+async function detail(name){
+  const box=document.getElementById('detail');box.innerHTML='загрузка…';
+  const j=await (await fetch('/api/meta/object?name='+encodeURIComponent(name))).json();
+  const badge=o=>o==='base'?'<span class="badge base">БАЗА</span>':'<span class="badge ext">РАСШИРЕНИЕ</span>';
+  let h='<h3>'+j.name.replace(/</g,'&lt;')+'</h3>';
+  h+='<div>Действует: <b>'+(j.effective.layer||'').replace(/</g,'&lt;')+'</b> '+badge(j.effective.origin)+'</div>';
+  (j.extending||[]).forEach(e=>{h+='<div>Слой: <b>'+e.layer.replace(/</g,'&lt;')+'</b> '+badge(e.origin)+' · '+e.relation+'</div>';});
+  h+='<h4>Структура</h4><pre>'+j.structure.replace(/</g,'&lt;')+'</pre>';
+  h+='<h4>Формы</h4><pre>'+j.forms.replace(/</g,'&lt;')+'</pre>';
+  box.innerHTML=h;
+}
+cats();
+</script></body></html>"""
+
+
+@app.get("/metadata")
+def metadata_page():
+    return Response(META_PAGE, mimetype="text/html",
                     headers={"Cache-Control": "no-store, max-age=0"})
 
 
