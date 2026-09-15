@@ -164,6 +164,126 @@ def gpu_summary():
                 "detail": str(e)[:200] + " (запустите монитор с --gpus all)"}
 
 
+def parse_mcp_payloads(text):
+    """SSE data: строки и plain JSON -> список payload."""
+    out = []
+    for ln in (text or "").splitlines():
+        ln = ln.strip()
+        if ln.startswith("data:"):
+            ln = ln[5:].strip()
+        if ln.startswith("{"):
+            try:
+                out.append(json.loads(ln))
+            except Exception:
+                pass
+    return out
+
+
+def mcp_call(port, tool, args, timeout=90):
+    """Вызов MCP-инструмента: initialize -> tools/call. Возвращает текст результата."""
+    import uuid as _uuid
+    url = f"http://host.docker.internal:{port}/mcp"
+    h = {"Content-Type": "application/json",
+         "Accept": "application/json, text/event-stream"}
+    base = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "mcp-monitor", "version": "1.0"}}}
+    try:
+        s = requests.Session()
+        r = s.post(url, headers=h, timeout=timeout, json=base)
+        sess = r.headers.get("Mcp-Session-Id") or r.headers.get("mcp-session-id")
+        h2 = dict(h)
+        if sess:
+            h2["Mcp-Session-Id"] = sess
+        try:
+            s.post(url, headers=h2, timeout=15,
+                   json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+        except Exception:
+            pass
+        r2 = s.post(url, headers=h2, timeout=timeout,
+                    json={"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                          "params": {"name": tool, "arguments": args or {}}})
+        texts = []
+        for p in parse_mcp_payloads(r2.text):
+            res = p.get("result", {})
+            for c in res.get("content", []) or []:
+                if isinstance(c, dict) and c.get("text"):
+                    texts.append(str(c["text"]))
+            if res.get("structuredContent") and not texts:
+                texts.append(json.dumps(res["structuredContent"],
+                                        ensure_ascii=False)[:4000])
+            if p.get("error") and not texts:
+                texts.append("ERROR: " + json.dumps(p["error"], ensure_ascii=False)[:500])
+        body = "\n".join(texts) if texts else r2.text[:2000]
+        return {"ok": True, "text": body[:4000]}
+    except Exception as e:
+        return {"ok": False, "text": str(e)[:300]}
+
+
+def du_mb(container, path):
+    try:
+        c = dclient().containers.get(container)
+        out = c.exec_run(["du", "-sb", path])
+        num = out.output.decode("utf-8", "replace").split()[0]
+        return round(int(num) / 1048576, 1)
+    except Exception:
+        return None
+
+
+# Что показывать в панели «Данные»: MCP-запросы, замеры диска, действия.
+DATA_SPECS = {
+    "codemeta": {"port": 8000,
+                 "calls": [("stats", {})],
+                 "du": [("1c_code_metadata_mcp", "/app/chroma_db")],
+                 "actions": ["reindex"]},
+    "graphbeta": {"port": 8106,
+                  "calls": [("get_graph_stats", {}), ("list_graph_projects", {}),
+                            ("get_indexing_status", {})],
+                  "du": [("1c_graph_metadata_beta", "/app/data"),
+                         ("neo4j_beta", "/data")],
+                  "actions": ["refresh_layers", "delete_project"]},
+    "help": {"port": 8003, "calls": [],
+             "du": [("1c_help_mcp", "/app/chroma_db")], "actions": []},
+    "ssl": {"port": 8008, "calls": [],
+            "du": [("1c_ssl_mcp", "/app/zvec_db")], "actions": []},
+    "templates": {"port": 8004, "calls": [],
+                  "du": [("1c_templates_mcp", "/app/chroma_db")], "actions": []},
+}
+
+
+@app.get("/api/data/<key>")
+def api_data(key):
+    spec = DATA_SPECS.get(key)
+    if not spec:
+        return jsonify({"error": "no data spec"}), 404
+    stats = []
+    for tool, args in spec["calls"]:
+        r = mcp_call(spec["port"], tool, args)
+        stats.append({"tool": tool, "ok": r["ok"], "text": r["text"]})
+    disk = [{"path": f"{c}:{p}", "mb": du_mb(c, p)} for c, p in spec["du"]]
+    return jsonify({"stats": stats, "disk": disk, "actions": spec["actions"]})
+
+
+@app.post("/api/action/<key>/<action>")
+def api_action(key, action):
+    import uuid as _uuid
+    if key == "codemeta" and action == "reindex":
+        return jsonify(mcp_call(8000, "reindex", {}, timeout=60))
+    if key == "graphbeta" and action == "refresh_layers":
+        op = _uuid.uuid4().hex[:12]
+        return jsonify(mcp_call(8106, "refresh_extension_layers",
+                                {"operation_id": op}, timeout=600))
+    if key == "graphbeta" and action == "delete_project":
+        pid = (request.get_json(silent=True) or {}).get("project_id", "")
+        if not pid:
+            return jsonify({"ok": False, "text": "нужен project_id"}), 400
+        return jsonify(mcp_call(8106, "delete_graph_project",
+                                {"project_id": pid,
+                                 "operation_id": _uuid.uuid4().hex[:12]},
+                                timeout=120))
+    return jsonify({"ok": False, "text": "unknown action"}), 400
+
+
 def dclient():
     return docker.from_env()
 
@@ -303,6 +423,7 @@ def api_status():
                     "desc": s["desc"], "expected_tools": s["tools"],
                     "channel": s.get("channel", ""), "note": s.get("note", ""),
                     "switchable": s["key"] in RUN_SPECS,
+                    "has_data": s["key"] in DATA_SPECS,
                     "state": state, "container": ci, "mcp": mcp, "progress": prog})
     return jsonify({"servers": out, "ts": int(time.time())})
 
@@ -406,9 +527,11 @@ async function refresh(){
     <div class="row">Инструменты: ${tools}</div>${bar}
     ${p.line?`<div class="logline">${p.line.replace(/</g,'&lt;')}</div>`:''}
     <div class="btns"><button onclick="logs('${s.key}','${s.name}')">логи</button>
+    ${s.has_data?`<button onclick="dataPanel('${s.key}')">данные</button>`:''}
     ${s.switchable?`<button onclick="mode('${s.key}','gpu')">на GPU</button><button onclick="mode('${s.key}','cpu')">на CPU</button>`:''}
     <button onclick="ctl('${s.key}','start')">start</button><button onclick="ctl('${s.key}','stop')">stop</button>
-    <button onclick="ctl('${s.key}','restart')">restart</button></div></div>`}).join('');
+    <button onclick="ctl('${s.key}','restart')">restart</button></div>
+    ${s.has_data?`<div class="logline" id="data-${s.key}" style="display:none">…</div>`:''}</div>`}).join('');
   const lb=document.getElementById('logbtns');
   if(!lb.children.length){lb.innerHTML=j.servers.map(s=>`<button onclick="logs('${s.key}','${s.name}')">${s.name}</button>`).join('');}
 }
@@ -426,7 +549,32 @@ async function mode(key,which){
 async function logs(key,title){
   const cname=CNAME[key]||key;
   const r=await fetch(`/api/logs/${cname}?tail=80`);
-  document.getElementById('biglog').textContent='=== '+cname+' ===\\n'+await r.text();
+  document.getElementById('biglog').textContent='=== '+cname+' ===\n'+await r.text();
+}
+async function dataPanel(key){
+  const box=document.getElementById('data-'+key);
+  if(box.style.display!=='none'){box.style.display='none';return;}
+  box.style.display='block';box.textContent='запрос stats…';
+  const d=await (await fetch(`/api/data/${key}`)).json();
+  let html='';
+  (d.disk||[]).forEach(x=>{html+=`<div class="row">Диск ${x.path.replace(/</g,'&lt;')}: <b>${x.mb??'?'} МБ</b></div>`;});
+  (d.stats||[]).forEach(s=>{html+=`<div class="row">§ ${s.tool} ${s.ok?'':'(ошибка)'}</div><div class="logline" style="max-height:150px">${s.text.replace(/</g,'&lt;')}</div>`;});
+  const acts={"reindex":"переиндексировать (фон)","refresh_layers":"перечитать слои расширений (долго!)","delete_project":"удалить граф-проект…"};
+  (d.actions||[]).forEach(a=>{html+=`<button onclick="runAction('${key}','${a}')">${acts[a]||a}</button> `;});
+  box.innerHTML=html||'нет данных';
+}
+async function runAction(key,action){
+  let body=null;
+  if(action==='delete_project'){
+    const pid=prompt('project_id для удаления (см. list_graph_projects выше):');
+    if(!pid)return;
+    if(!confirm(`УДАЛИТЬ проект ${pid} из графа? Безвозвратно.`))return;
+    body={project_id:pid};
+  }else if(!confirm('Выполнить «'+action+'»?'))return;
+  const r=await fetch(`/api/action/${key}/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):null});
+  const j=await r.json();
+  alert((j.ok?'OK: ':'ОШИБКА: ')+(j.text||j.error||'').slice(0,500));
+  dataPanel(key);dataPanel(key);
 }
 async function gpuRefresh(){
   const box=document.getElementById('gpupanel');
