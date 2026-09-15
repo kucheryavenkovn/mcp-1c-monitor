@@ -28,6 +28,10 @@ SERVERS = [
      "port": 8007, "desc": "Проверка через 1С:Напарник (нужен токен)", "tools": []},
     {"key": "neo4j", "name": "Neo4j (для Graph)", "container": "neo4j",
      "port": 7474, "desc": "Графовая БД", "tools": [], "no_mcp": True},
+    {"key": "graphbeta", "name": "GraphMetadata-beta", "container": "1c_graph_metadata_beta",
+     "port": 8106, "desc": "Граф связей, beta-контур (Neo4j-beta)", "tools": ["list_graph_projects", "resolve_effective_entity"]},
+    {"key": "neo4jbeta", "name": "Neo4j-beta", "container": "neo4j_beta",
+     "port": 7574, "desc": "Графовая БД beta-контура", "tools": [], "no_mcp": True},
 ]
 
 PROGRESS_RE = re.compile(
@@ -243,7 +247,7 @@ async function refresh(){
   const lb=document.getElementById('logbtns');
   if(!lb.children.length){lb.innerHTML=j.servers.map(s=>`<button onclick="logs('${s.key}','${s.name}')">${s.name}</button>`).join('');}
 }
-const CNAME={help:'1c_help_mcp',graph:'1c_graph_metadata',codemeta:'1c_code_metadata_mcp',ssl:'1c_ssl_mcp',templates:'1c_templates_mcp',syntax:'1c_syntaxcheck_mcp',checker:'1c_code_checker',neo4j:'neo4j'};
+const CNAME={help:'1c_help_mcp',graph:'1c_graph_metadata',codemeta:'1c_code_metadata_mcp',ssl:'1c_ssl_mcp',templates:'1c_templates_mcp',syntax:'1c_syntaxcheck_mcp',checker:'1c_code_checker',neo4j:'neo4j',graphbeta:'1c_graph_metadata_beta',neo4jbeta:'neo4j_beta'};
 async function ctl(key,action){
   await fetch(`/api/control/${CNAME[key]}/${action}`,{method:'POST'});refresh();
 }
