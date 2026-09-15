@@ -489,6 +489,9 @@ white-space:pre-wrap;word-break:break-word;max-height:76px;overflow:auto}
 button{background:#2a3450;color:#e8ecf4;border:1px solid #3a4670;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
 button:hover{background:#35436b}
 pre#biglog{background:#0c1220;border:1px solid #2a3450;border-radius:8px;padding:10px;max-height:300px;overflow:auto;font-size:12px}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.65);display:flex;align-items:center;justify-content:center;z-index:50}
+.modal{background:#1a2133;border:1px solid #3a4670;border-radius:12px;padding:16px;max-width:820px;width:92%;max-height:86vh;overflow:auto}
+.modal h3{margin:0 0 8px;font-size:16px}
 #ts{color:#8b93a7;font-size:12px}
 </style></head><body>
 <h1>1C MCP — мониторинг флота</h1>
@@ -501,6 +504,9 @@ pre#biglog{background:#0c1220;border:1px solid #2a3450;border-radius:8px;padding
 <h3>Логи контейнера</h3>
 <div class="btns" id="logbtns"></div>
 <pre id="biglog">выберите контейнер…</pre>
+<div class="overlay" id="ovl" style="display:none" onclick="if(event.target===this)closeModal()">
+<div class="modal"><div class="btns" style="margin:0 0 8px"><button onclick="closeModal()">закрыть ✕</button> <span id="modaltitle"></span></div><div id="modalbody">…</div></div>
+</div>
 <script>
 const grid=document.getElementById('grid'),ts=document.getElementById('ts');
 const showBox=document.getElementById('showdead'),hiddenBox=document.getElementById('hidden');
@@ -530,11 +536,10 @@ async function refresh(){
     <div class="row">Инструменты: ${tools}</div>${bar}
     ${p.line?`<div class="logline">${p.line.replace(/</g,'&lt;')}</div>`:''}
     <div class="btns"><button onclick="logs('${s.key}','${s.name}')">логи</button>
-    ${s.has_data?`<button onclick="dataPanel('${s.key}')">данные</button>`:''}
+    ${s.has_data?`<button onclick="dataPanel('${s.key}','${s.name}')">данные</button>`:''}
     ${s.switchable?`<button onclick="mode('${s.key}','gpu')">на GPU</button><button onclick="mode('${s.key}','cpu')">на CPU</button>`:''}
     <button onclick="ctl('${s.key}','start')">start</button><button onclick="ctl('${s.key}','stop')">stop</button>
-    <button onclick="ctl('${s.key}','restart')">restart</button></div>
-    ${s.has_data?`<div class="logline" id="data-${s.key}" style="display:none">…</div>`:''}</div>`}).join('');
+    <button onclick="ctl('${s.key}','restart')">restart</button></div></div>`}).join('');
   const lb=document.getElementById('logbtns');
   if(!lb.children.length){lb.innerHTML=j.servers.map(s=>`<button onclick="logs('${s.key}','${s.name}')">${s.name}</button>`).join('');}
   }catch(e){
@@ -557,10 +562,16 @@ async function logs(key,title){
   const r=await fetch(`/api/logs/${cname}?tail=80`);
   document.getElementById('biglog').textContent='=== '+cname+' ===\\n'+await r.text();
 }
-async function dataPanel(key){
-  const box=document.getElementById('data-'+key);
-  if(box.style.display!=='none'){box.style.display='none';return;}
-  box.style.display='block';box.textContent='запрос stats…';
+function closeModal(){document.getElementById('ovl').style.display='none';}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal();});
+async function dataPanel(key,title){
+  document.getElementById('ovl').style.display='flex';
+  document.getElementById('modaltitle').textContent='Данные: '+(title||key);
+  loadData(key);
+}
+async function loadData(key){
+  const box=document.getElementById('modalbody');
+  box.innerHTML='запрос stats…';
   const d=await (await fetch(`/api/data/${key}`)).json();
   let html='';
   (d.disk||[]).forEach(x=>{html+=`<div class="row">Диск ${x.path.replace(/</g,'&lt;')}: <b>${x.mb??'?'} МБ</b></div>`;});
@@ -580,7 +591,7 @@ async function runAction(key,action){
   const r=await fetch(`/api/action/${key}/${action}`,{method:'POST',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):null});
   const j=await r.json();
   alert((j.ok?'OK: ':'ОШИБКА: ')+(j.text||j.error||'').slice(0,500));
-  dataPanel(key);dataPanel(key);
+  loadData(key);
 }
 async function gpuRefresh(){
   const box=document.getElementById('gpupanel');
