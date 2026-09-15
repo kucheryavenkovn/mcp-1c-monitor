@@ -948,4 +948,7 @@ def metadata_page():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8090)
+    # Production WSGI вместо dev-сервера Flask: держит конкурентные
+    # долгие запросы (пересборка, refresh слоёв) без подвисаний.
+    from waitress import serve
+    serve(app, host="0.0.0.0", port=8090, threads=8)
