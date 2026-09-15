@@ -79,7 +79,9 @@ RUN_SPECS = {
                  "lic_env": "LICENSE_KEY_CODEMETADATA", "port": 8000,
                  "env": {"METADATA_PATH": "/app/code", "CODE_PATH": "/app/code",
                          "SOURCE_FORMAT": "auto", "RESET_CACHE": "false",
-                         "RESET_DATABASE": "false", "USESSE": "false"},
+                         "RESET_DATABASE": "false", "USESSE": "false",
+                         "PARSE_WORKERS": "16", "EMBEDDING_CONCURRENCY": "10",
+                         "EMBED_BATCH_SIZE_LOCAL": "128", "SUB_INDEX_WORKERS": "8"},
                  "binds": [("PATH_CODE", "/app/code", "ro"),
                            (("PATH_BASES", "mcp_codemetadata"), "/app/chroma_db", "rw")]},
 }

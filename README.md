@@ -77,6 +77,13 @@ docker run -d --name mcp_1c_monitor --restart unless-stopped `
 CodeMetadata. SyntaxCheck (без модели), 1CCodeChecker (облачный API) и
 Graph в `graph_only` GPU не используют — кнопок у них нет.
 
+Тюнинг индексации CodeMetadata (32 CPU + RTX 4090, замерено: 21.7 →
+1400+ файлов/мин): `PARSE_WORKERS=16`, `EMBEDDING_CONCURRENCY=10`,
+`EMBED_BATCH_SIZE_LOCAL=128`, `SUB_INDEX_WORKERS=8`. Имена взяты из
+`/app/src/main.py` образа. Перезапуск докачивает инкрементально
+(`file_tracker`: unchanged пропускаются), полный перестрой — только при
+смене модели или `RESET_DATABASE=true`.
+
 ## Панель «Данные» (проекты внутри индексов)
 
 Кнопка **«данные»** на карточках показывает, что лежит внутри баз серверов:
