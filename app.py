@@ -13,25 +13,38 @@ app = Flask(__name__)
 # Stable fleet. `container=None` means compose-managed pair shown separately.
 SERVERS = [
     {"key": "help", "name": "HelpSearch", "container": "1c_help_mcp",
-     "port": 8003, "desc": "Справка платформы 1С", "tools": ["docsearch", "docinfo", "formatspec", "standards"]},
+     "port": 8003, "desc": "Справка платформы 1С", "tools": ["docsearch", "docinfo", "formatspec", "standards"],
+     "channel": "stable · latest"},
     {"key": "graph", "name": "GraphMetadata", "container": "1c_graph_metadata",
-     "port": 8006, "desc": "Граф связей (Neo4j)", "tools": ["list_graph_projects", "resolve_effective_entity"]},
+     "port": 8006, "desc": "Граф связей (Neo4j)", "tools": ["list_graph_projects", "resolve_effective_entity"],
+     "channel": "stable · контракт 1.x (СТАРЫЙ)",
+     "note": "Не работает с Designer XML напрямую (ждёт .txt старого формата). Контейнеры удалены; рабочий — beta-контур ниже."},
     {"key": "codemeta", "name": "CodeMetadata", "container": "1c_code_metadata_mcp",
-     "port": 8000, "desc": "Метаданные + BSL-код (28 инструментов)", "tools": ["metadatasearch", "codesearch", "stats"]},
+     "port": 8000, "desc": "Метаданные + BSL-код (28 инструментов)", "tools": ["metadatasearch", "codesearch", "stats"],
+     "channel": "stable · latest"},
     {"key": "ssl", "name": "SSLSearch", "container": "1c_ssl_mcp",
-     "port": 8008, "desc": "Поиск по БСП", "tools": ["ssl_search"]},
+     "port": 8008, "desc": "Поиск по БСП", "tools": ["ssl_search"],
+     "channel": "stable · latest"},
     {"key": "templates", "name": "TemplatesSearch", "container": "1c_templates_mcp",
-     "port": 8004, "desc": "Шаблоны + память проекта", "tools": ["templatesearch", "remember", "recall"]},
+     "port": 8004, "desc": "Шаблоны + память проекта", "tools": ["templatesearch", "remember", "recall"],
+     "channel": "stable · latest"},
     {"key": "syntax", "name": "SyntaxCheck", "container": "1c_syntaxcheck_mcp",
-     "port": 8002, "desc": "Проверка синтаксиса BSL", "tools": ["syntaxcheck"]},
+     "port": 8002, "desc": "Проверка синтаксиса BSL", "tools": ["syntaxcheck"],
+     "channel": "stable · latest"},
     {"key": "checker", "name": "1CCodeChecker", "container": "1c_code_checker",
-     "port": 8007, "desc": "Проверка через 1С:Напарник (нужен токен)", "tools": []},
+     "port": 8007, "desc": "Проверка через 1С:Напарник (нужен токен)", "tools": [],
+     "channel": "stable · latest"},
     {"key": "neo4j", "name": "Neo4j (для Graph)", "container": "neo4j",
-     "port": 7474, "desc": "Графовая БД", "tools": [], "no_mcp": True},
+     "port": 7474, "desc": "Графовая БД", "tools": [], "no_mcp": True,
+     "channel": "stable-контур (СТАРЫЙ)",
+     "note": "База нерабочего stable-контура. Контейнер удалён."},
     {"key": "graphbeta", "name": "GraphMetadata-beta", "container": "1c_graph_metadata_beta",
-     "port": 8106, "desc": "Граф связей, beta-контур (Neo4j-beta)", "tools": ["list_graph_projects", "resolve_effective_entity"]},
+     "port": 8106, "desc": "Граф связей, beta-контур (Neo4j-beta)", "tools": ["list_graph_projects", "resolve_effective_entity"],
+     "channel": "beta · контракт 2.0 (РАБОЧИЙ)",
+     "note": "Единственный рабочий граф: читает Designer XML и расширения напрямую."},
     {"key": "neo4jbeta", "name": "Neo4j-beta", "container": "neo4j_beta",
-     "port": 7574, "desc": "Графовая БД beta-контура", "tools": [], "no_mcp": True},
+     "port": 7574, "desc": "Графовая БД beta-контура", "tools": [], "no_mcp": True,
+     "channel": "beta-контур (РАБОЧИЙ)"},
 ]
 
 PROGRESS_RE = re.compile(
@@ -168,6 +181,7 @@ def api_status():
             state = "stopped"
         out.append({"key": s["key"], "name": s["name"], "port": s["port"],
                     "desc": s["desc"], "expected_tools": s["tools"],
+                    "channel": s.get("channel", ""), "note": s.get("note", ""),
                     "state": state, "container": ci, "mcp": mcp, "progress": prog})
     return jsonify({"servers": out, "ts": int(time.time())})
 
@@ -204,6 +218,7 @@ h1{font-size:20px;margin:0 0 4px}.sub{color:#8b93a7;font-size:13px;margin-bottom
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:12px}
 .card{background:#1a2133;border:1px solid #2a3450;border-radius:10px;padding:12px 14px}
 .card h2{font-size:16px;margin:0 0 2px}.desc{color:#8b93a7;font-size:12px;margin-bottom:8px}
+.chan{font-size:11px;color:#7cc7ff;margin-bottom:6px}.note{font-size:12px;color:#ffd76a;margin:6px 0}
 .badge{display:inline-block;padding:2px 10px;border-radius:20px;font-size:12px;font-weight:600}
 .ready{background:#0f5132;color:#7dffa8}.indexing{background:#5a4100;color:#ffd76a}
 .starting{background:#0b3d5c;color:#7cc7ff}.stopped{background:#3a3f4d;color:#b9bfd0}
@@ -220,22 +235,30 @@ pre#biglog{background:#0c1220;border:1px solid #2a3450;border-radius:8px;padding
 #ts{color:#8b93a7;font-size:12px}
 </style></head><body>
 <h1>1C MCP — мониторинг флота</h1>
-<div class="sub">Docker + MCP-зонды + прогресс индексации из логов. Обновление каждые 5 с. <span id="ts"></span></div>
+<div class="sub">Docker + MCP-зонды + прогресс индексации из логов. Обновление каждые 5 с. <span id="ts"></span><br>
+<label><input type="checkbox" id="showdead"> показывать остановленные / legacy</label> <span id="hidden"></span></div>
 <div class="grid" id="grid"></div>
 <h3>Логи контейнера</h3>
 <div class="btns" id="logbtns"></div>
 <pre id="biglog">выберите контейнер…</pre>
 <script>
 const grid=document.getElementById('grid'),ts=document.getElementById('ts');
+const showBox=document.getElementById('showdead'),hiddenBox=document.getElementById('hidden');
+showBox.checked=localStorage.getItem('mcpmon_showdead')==='1';
+showBox.onchange=()=>{localStorage.setItem('mcpmon_showdead',showBox.checked?'1':'0');refresh();};
 async function refresh(){
   const r=await fetch('/api/status');const j=await r.json();
   ts.textContent='обновлено '+new Date(j.ts*1000).toLocaleTimeString();
-  grid.innerHTML=j.servers.map(s=>{
+  const vis=j.servers.filter(s=>showBox.checked||!['stopped','missing'].includes(s.state));
+  hiddenBox.textContent=showBox.checked?'':('скрыто остановленных: '+(j.servers.length-vis.length));
+  grid.innerHTML=vis.map(s=>{
     const c=s.container,m=s.mcp,p=s.progress;
     const tools=(m.tools&&m.tools.length)?m.tools.join(', '):(s.expected_tools.join(', ')||'—');
     const bar=(p.percent!=null)?`<div class="bar"><i style="width:${p.percent}%"></i></div><div class="row">Индексация: <b>${p.percent}%</b></div>`:'';
     return `<div class="card"><h2>${s.name} <span style="color:#8b93a7">:${s.port}</span></h2>
     <div class="desc">${s.desc}</div>
+    ${s.channel?`<div class="chan">${s.channel}</div>`:''}
+    ${s.note?`<div class="note">${s.note}</div>`:''}
     <div><span class="badge ${s.state}">${s.state}</span></div>
     <div class="row">Контейнер: <b>${c.status||'?'}</b>${c.health?' · health: <b>'+c.health+'</b>':''}${c.uptime?' · uptime '+c.uptime:''}${c.restarts?' · рестартов: <b>'+c.restarts+'</b>':''}</div>
     <div class="row">MCP: <b>${m.ok===true?'отвечает ('+m.ms+' мс)':(m.ok===false?'не отвечает':'—')}</b>${m.http?' · HTTP '+m.http:''} · лицензия: <b>${p.license}</b></div>
