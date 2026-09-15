@@ -259,7 +259,93 @@ def du_mb(container, path):
         return None
 
 
-# Что показывать в панели «Данные»: MCP-запросы, замеры диска, действия.
+# Редактируемые настройки параллелизма индексации.
+INDEXING_VARS = {
+    "codemeta": [
+        {"name": "PARSE_WORKERS", "default": "8", "max": 64,
+         "desc": "потоки разбора файлов"},
+        {"name": "EMBEDDING_CONCURRENCY", "default": "6", "max": 32,
+         "desc": "параллельных эмбеддингов (локальную модель образ режет до 1)"},
+        {"name": "EMBED_BATCH_SIZE_LOCAL", "default": "64", "max": 1024,
+         "desc": "батч локальной embedding-модели"},
+        {"name": "SUB_INDEX_WORKERS", "default": "4", "max": 16,
+         "desc": "воркеры вторичных индексов"},
+    ],
+}
+EFF_RES = {"PARSE_WORKERS": re.compile(r"parse_workers=(\d+)"),
+           "EMBEDDING_CONCURRENCY": re.compile(r"embedding_concurrency=(\d+)"),
+           "EMBED_BATCH_SIZE_LOCAL": re.compile(r"embed_batch_size_local=([^\s,)]+)")}
+
+
+def indexing_state(key):
+    spec = RUN_SPECS.get(key, {})
+    try:
+        c = dclient().containers.get(spec.get("container", ""))
+        env = {}
+        for e in (c.attrs.get("Config", {}) or {}).get("Env", []) or []:
+            if "=" in e:
+                k, v = e.split("=", 1)
+                env[k] = v
+        logs = c.logs(tail=500).decode("utf-8", "replace")
+    except Exception as e:
+        return {"error": str(e)[:200]}
+    out = []
+    for v in INDEXING_VARS.get(key, []):
+        eff = ""
+        m = EFF_RES.get(v["name"])
+        if m:
+            f = m.search(logs)
+            eff = f.group(1) if f else ""
+        out.append({"name": v["name"], "desc": v["desc"], "default": v["default"],
+                    "max": v["max"], "configured": env.get(v["name"], ""),
+                    "effective": eff})
+    return {"vars": out}
+
+
+@app.get("/api/indexing/<key>")
+def api_indexing(key):
+    if key not in INDEXING_VARS:
+        return jsonify({"error": "not tunable"}), 404
+    return jsonify(indexing_state(key))
+
+
+@app.post("/api/indexing/<key>")
+def api_indexing_set(key):
+    if key not in INDEXING_VARS:
+        return jsonify({"ok": False, "error": "not tunable"}), 404
+    want = request.get_json(silent=True) or {}
+    extra, errors = {}, []
+    for v in INDEXING_VARS[key]:
+        if v["name"] not in want:
+            continue
+        try:
+            n = int(want[v["name"]])
+        except (TypeError, ValueError):
+            errors.append(f"{v['name']}: не число")
+            continue
+        if not 1 <= n <= v["max"]:
+            errors.append(f"{v['name']}: 1..{v['max']}")
+            continue
+        extra[v["name"]] = n
+    if errors:
+        return jsonify({"ok": False, "error": "; ".join(errors)}), 400
+    if not extra:
+        return jsonify({"ok": False, "error": "пусто"}), 400
+    # Режим (GPU/CPU) сохраняем текущий, профиль дополняем ручными значениями.
+    try:
+        c = dclient().containers.get(RUN_SPECS[key]["container"])
+        gpu = False
+        for d in (c.attrs.get("HostConfig", {}) or {}).get("DeviceRequests") or []:
+            if "gpu" in str(d.get("Capabilities", [])).lower():
+                gpu = True
+    except Exception:
+        gpu = True
+    try:
+        r = recreate(key, gpu, extra)
+        r["mode_kept"] = "GPU" if gpu else "CPU"
+        return jsonify(r)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:300]}), 500
 DATA_SPECS = {
     "codemeta": {"port": 8000,
                  "calls": [("stats", {})],
@@ -289,7 +375,8 @@ def api_data(key):
     # каждая со своим таймером (см. /api/stat), чтобы окно не висело молча.
     disk = [{"path": f"{c}:{p}", "mb": du_mb(c, p)} for c, p in spec["du"]]
     return jsonify({"stat_tools": [t for t, _ in spec["calls"]],
-                    "disk": disk, "actions": spec["actions"]})
+                    "disk": disk, "actions": spec["actions"],
+                    "tunable": key in INDEXING_VARS})
 
 
 @app.get("/api/stat/<key>/<tool>")
@@ -620,6 +707,7 @@ pre#biglog{background:#0c1220;border:1px solid #2a3450;border-radius:8px;padding
 .modal{background:#1a2133;border:1px solid #3a4670;border-radius:12px;padding:16px;max-width:820px;width:92%;max-height:86vh;overflow:auto}
 .modal h3{margin:0 0 8px;font-size:16px}
 #ts{color:#8b93a7;font-size:12px}
+input[type=number]{background:#0c1220;color:#e8ecf4;border:1px solid #3a4670;border-radius:6px;padding:4px 8px;font-size:13px}
 </style></head><body>
 <h1>1C MCP — мониторинг флота</h1>
 <div class="sub">Docker + MCP-зонды + прогресс индексации из логов. Обновление каждые 5 с. <span id="ts"></span><br>
@@ -708,9 +796,11 @@ async function loadData(key){
   if(key==='graphbeta'){html+=`<div class="row"><a href="/metadata" style="color:#7cc7ff"><b>Просмотрщик метаданных: справочники, документы, слои базы и расширения →</b></a></div>`;}
   (d.disk||[]).forEach(x=>{html+=`<div class="row">Диск ${x.path.replace(/</g,'&lt;')}: <b>${x.mb??'?'} МБ</b></div>`;});
   html+='<div id="statrows"></div>';
+  if(d.tunable){html+='<div id="tunebox">параллелизм…</div>';}
   const acts={"reindex":"переиндексировать (фон)","refresh_layers":"перечитать слои расширений (долго!)","delete_project":"удалить граф-проект…"};
   (d.actions||[]).forEach(a=>{html+=`<button onclick="runAction('${key}','${a}')">${acts[a]||a}</button> `;});
   box.innerHTML=html||'нет данных';
+  if(d.tunable)loadTuning(key);
   const rows=document.getElementById('statrows');
   (d.stat_tools||[]).forEach(tool=>{
     const t0=Date.now();
@@ -726,6 +816,27 @@ async function loadData(key){
       div.innerHTML=`<div class="row">§ ${tool} ${s.ok?'':'(ошибка)'} · заняло <b>${took}</b></div><div class="logline" style="max-height:150px">${s.text.replace(/</g,'&lt;')}</div>`;
     }).catch(e=>{clearInterval(iv);div.innerHTML=`<div class="row">§ ${tool} — ошибка: ${String(e).slice(0,120)}</div>`;});
   });
+}
+async function loadTuning(key){
+  const tb=document.getElementById('tunebox');
+  if(!tb)return;
+  const t=await (await fetch(`/api/indexing/${key}`)).json();
+  if(t.error){tb.innerHTML='параллелизм: '+t.error;return;}
+  let h='<div class="row"><b>Параллелизм индексации</b> (применение = пересоздание ~1 мин, докачка продолжится)</div>';
+  t.vars.forEach(v=>{
+    h+=`<div class="row">${v.name} <small>(${v.desc}; дефолт ${v.default})</small><br>настроено: <b>${v.configured||'—'}</b> · сейчас работает: <b>${v.effective||'—'}</b><br><input type="number" min="1" max="${v.max}" value="${v.configured||v.default}" id="tune-${v.name}" style="width:90px"></div>`;
+  });
+  h+=`<button onclick="applyTuning('${key}')">применить</button>`;
+  tb.innerHTML=h;
+}
+async function applyTuning(key){
+  const body={};
+  document.querySelectorAll('[id^="tune-"]').forEach(e=>{body[e.id.slice(5)]=e.value;});
+  if(!confirm('Пересоздать контейнер с этими значениями?'))return;
+  const r=await fetch(`/api/indexing/${key}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j=await r.json();
+  alert((j.ok?'OK':'ОШИБКА')+': '+(j.error||('режим '+j.mode_kept+', новые значения подхватятся при старте индексации')));
+  loadData(key);
 }
 async function runAction(key,action){
   let body=null;
@@ -780,6 +891,7 @@ a{color:#7cc7ff}.chips{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}
 .base{background:#0f5132;color:#7dffa8}.ext{background:#5a4100;color:#ffd76a}
 pre{background:#0c1220;border-radius:6px;padding:8px;font-size:12px;max-height:300px;overflow:auto;white-space:pre-wrap}
 input[type=text]{background:#0c1220;color:#e8ecf4;border:1px solid #3a4670;border-radius:6px;padding:6px 10px;font-size:13px;width:280px}
+input[type=number]{background:#0c1220;color:#e8ecf4;border:1px solid #3a4670;border-radius:6px;padding:4px 8px;font-size:13px}
 button{background:#2a3450;color:#e8ecf4;border:1px solid #3a4670;border-radius:6px;padding:5px 12px;font-size:12px;cursor:pointer}
 </style></head><body>
 <h2>Метаданные: база и расширение</h2>
