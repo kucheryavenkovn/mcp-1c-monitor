@@ -274,31 +274,53 @@ def api_data(key):
     spec = DATA_SPECS.get(key)
     if not spec:
         return jsonify({"error": "no data spec"}), 404
-    stats = []
-    for tool, args in spec["calls"]:
-        r = mcp_call(spec["port"], tool, args)
-        stats.append({"tool": tool, "ok": r["ok"], "text": r["text"]})
+    # Быстрое: только диск и список запросов. Сами stats грузятся отдельно,
+    # каждая со своим таймером (см. /api/stat), чтобы окно не висело молча.
     disk = [{"path": f"{c}:{p}", "mb": du_mb(c, p)} for c, p in spec["du"]]
-    return jsonify({"stats": stats, "disk": disk, "actions": spec["actions"]})
+    return jsonify({"stat_tools": [t for t, _ in spec["calls"]],
+                    "disk": disk, "actions": spec["actions"]})
+
+
+@app.get("/api/stat/<key>/<tool>")
+def api_stat(key, tool):
+    import time as _t
+    spec = DATA_SPECS.get(key)
+    if not spec:
+        return jsonify({"error": "no data spec"}), 404
+    args = dict(spec["calls"])
+    if tool not in args:
+        return jsonify({"error": "unknown tool"}), 400
+    t0 = _t.time()
+    r = mcp_result(spec["port"], tool, args[tool], timeout=300)
+    text = r["text"]
+    inner = r.get("data")
+    if isinstance(inner, dict) and isinstance(inner.get("text"), str):
+        text = inner["text"]
+    return jsonify({"tool": tool, "ok": r["ok"], "text": text,
+                    "ms": int((_t.time() - t0) * 1000)})
 
 
 @app.post("/api/action/<key>/<action>")
 def api_action(key, action):
     import uuid as _uuid
+    # mcp_result (dict ok/text), а не mcp_call (голая строка) — фронту нужен ok.
     if key == "codemeta" and action == "reindex":
-        return jsonify(mcp_call(8000, "reindex", {}, timeout=60))
+        r = mcp_result(8000, "reindex", {}, timeout=60)
+        return jsonify({"ok": r["ok"], "text": r["text"]})
     if key == "graphbeta" and action == "refresh_layers":
         op = _uuid.uuid4().hex[:12]
-        return jsonify(mcp_call(8106, "refresh_extension_layers",
-                                {"operation_id": op}, timeout=600))
+        r = mcp_result(8106, "refresh_extension_layers",
+                       {"operation_id": op}, timeout=600)
+        return jsonify({"ok": r["ok"], "text": r["text"]})
     if key == "graphbeta" and action == "delete_project":
         pid = (request.get_json(silent=True) or {}).get("project_id", "")
         if not pid:
             return jsonify({"ok": False, "text": "нужен project_id"}), 400
-        return jsonify(mcp_call(8106, "delete_graph_project",
-                                {"project_id": pid,
-                                 "operation_id": _uuid.uuid4().hex[:12]},
-                                timeout=120))
+        r = mcp_result(8106, "delete_graph_project",
+                       {"project_id": pid,
+                        "operation_id": _uuid.uuid4().hex[:12]},
+                       timeout=120)
+        return jsonify({"ok": r["ok"], "text": r["text"]})
     return jsonify({"ok": False, "text": "unknown action"}), 400
 
 
@@ -657,8 +679,11 @@ async function logs(key,title){
   const r=await fetch(`/api/logs/${cname}?tail=80`);
   document.getElementById('biglog').textContent='=== '+cname+' ===\\n'+await r.text();
 }
-function closeModal(){document.getElementById('ovl').style.display='none';}
+let statTimers=[];
+function closeModal(){statTimers.forEach(clearInterval);statTimers=[];
+  document.getElementById('ovl').style.display='none';}
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal();});
+function fmtT(ms){const s=Math.floor(ms/1000);return s<60?s+' с':Math.floor(s/60)+' мин '+(s%60)+' с';}
 async function dataPanel(key,title){
   document.getElementById('ovl').style.display='flex';
   document.getElementById('modaltitle').textContent='Данные: '+(title||key);
@@ -666,14 +691,29 @@ async function dataPanel(key,title){
 }
 async function loadData(key){
   const box=document.getElementById('modalbody');
-  box.innerHTML='запрос stats…';
+  box.innerHTML='диск…';
   const d=await (await fetch(`/api/data/${key}`)).json();
   let html='';
   (d.disk||[]).forEach(x=>{html+=`<div class="row">Диск ${x.path.replace(/</g,'&lt;')}: <b>${x.mb??'?'} МБ</b></div>`;});
-  (d.stats||[]).forEach(s=>{html+=`<div class="row">§ ${s.tool} ${s.ok?'':'(ошибка)'}</div><div class="logline" style="max-height:150px">${s.text.replace(/</g,'&lt;')}</div>`;});
+  html+='<div id="statrows"></div>';
   const acts={"reindex":"переиндексировать (фон)","refresh_layers":"перечитать слои расширений (долго!)","delete_project":"удалить граф-проект…"};
   (d.actions||[]).forEach(a=>{html+=`<button onclick="runAction('${key}','${a}')">${acts[a]||a}</button> `;});
   box.innerHTML=html||'нет данных';
+  const rows=document.getElementById('statrows');
+  (d.stat_tools||[]).forEach(tool=>{
+    const t0=Date.now();
+    const div=document.createElement('div');
+    div.innerHTML=`<div class="row">§ ${tool} — выполняется… <b class="tm">0 с</b></div>`;
+    rows.appendChild(div);
+    const tm=div.querySelector('.tm');
+    const iv=setInterval(()=>{tm.textContent=fmtT(Date.now()-t0);},500);
+    statTimers.push(iv);
+    fetch(`/api/stat/${key}/${tool}`).then(r=>r.json()).then(s=>{
+      clearInterval(iv);
+      const took=fmtT(s.ms||(Date.now()-t0));
+      div.innerHTML=`<div class="row">§ ${tool} ${s.ok?'':'(ошибка)'} · заняло <b>${took}</b></div><div class="logline" style="max-height:150px">${s.text.replace(/</g,'&lt;')}</div>`;
+    }).catch(e=>{clearInterval(iv);div.innerHTML=`<div class="row">§ ${tool} — ошибка: ${String(e).slice(0,120)}</div>`;});
+  });
 }
 async function runAction(key,action){
   let body=null;
