@@ -1,3 +1,4 @@
 flask==3.1.0
 docker==7.1.0
 requests==2.32.3
+nvidia-ml-py==12.575.51

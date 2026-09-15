@@ -26,8 +26,13 @@ TemplatesSearch, SyntaxCheck, 1CCodeChecker + Neo4j), обновление ка�
 ## Быстрый старт
 
 ```powershell
+# 1. Заполните env-файл ВНЕ репозитория (ключи берутся только оттуда!)
+copy .env.monitor.example $env:USERPROFILE\.mcp-secrets\monitor.env
+
+# 2. Монитору нужен доступ к GPU для VRAM-панели — запускайте с --gpus all
 docker build -t mcp-1c-monitor:latest .
 docker run -d --name mcp_1c_monitor --restart unless-stopped `
+  --gpus all --env-file "$env:USERPROFILE\.mcp-secrets\monitor.env" `
   -p 127.0.0.1:8090:8090 `
   -v /var/run/docker.sock:/var/run/docker.sock `
   mcp-1c-monitor:latest
@@ -56,10 +61,27 @@ docker run -d --name mcp_1c_monitor --restart unless-stopped `
 2. **MCP Streamable HTTP** — `POST /mcp` с `initialize`, затем `tools/list`
 3. **Парсинг логов** — `code progress: N/M` → процент, `Invalid LICENSE_KEY` → авария
 
+## Видеокарта и переключение GPU/CPU
+
+Панель «Видеокарта»: занято/свободно VRAM (NVML), топ процессов.
+Сценарий «проиндексировал на GPU → освободил карту под LLM»:
+
+1. Начальная индексация идёт на `latest`-образах с `--gpus all` (быстро).
+2. Когда надо поднять локальную LLM на всю VRAM — на карточке каждого
+   сервера жмёте **«на CPU»**: монитор пересоздаёт контейнер без GPU.
+   Индексы живут в томах и сохраняются, переиндексация не нужна —
+   на CPU просто медленнее каждый отдельный запрос к эмбеддингам.
+3. Кнопка **«на GPU»** возвращает ускорение тем же пересозданием.
+
+Переключаются 4 сервера со встроенной моделью: Help, SSL, Templates,
+CodeMetadata. SyntaxCheck (без модели), 1CCodeChecker (облачный API) и
+Graph в `graph_only` GPU не используют — кнопок у них нет.
+
 ## Состав
 
 - `app.py` — весь сервис (API + страница в одном файле)
 - `Dockerfile`, `requirements.txt`
+- `.env.monitor.example` — шаблон env (без секретов)
 
 ## Лицензия
 

@@ -1,5 +1,7 @@
-"""1C MCP fleet monitor: Docker state + MCP liveness + index progress. Single file."""
+"""1C MCP fleet monitor: Docker state + MCP liveness + index progress + GPU panel
+с переключением серверов GPU/CPU. Single file."""
 import json
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -9,6 +11,7 @@ import requests
 from flask import Flask, jsonify, request, Response
 
 app = Flask(__name__)
+ENV = os.environ.get
 
 # Stable fleet. `container=None` means compose-managed pair shown separately.
 SERVERS = [
@@ -52,6 +55,114 @@ PROGRESS_RE = re.compile(
     re.IGNORECASE)
 ETA_RE = re.compile(r"ETA\s*([^\s|]+)", re.IGNORECASE)
 
+# Спецификации запуска GPU-серверов (latest-образы со встроенной моделью).
+# Секретов здесь НЕТ: ключи и пути берутся из окружения монитора.
+# Binds: (ENV-ИМЯ [или (ENV-ИМЯ, подкаталог)], путь в контейнере, режим).
+RUN_SPECS = {
+    "help": {"container": "1c_help_mcp", "image": "comol/1c_help_mcp:latest",
+             "lic_env": "LICENSE_KEY_HELP", "port": 8003,
+             "env": {"1C_BIN_PATH": "/1c_docs", "RESET_CACHE": "false",
+                     "RESET_DATABASE": "false", "USESSE": "false"},
+             "binds": [("PATH_1C_BIN", "/1c_docs", "rw"),
+                       (("PATH_BASES", "mcp_docs"), "/app/chroma_db", "rw")]},
+    "ssl": {"container": "1c_ssl_mcp", "image": "comol/mcp_ssl_server:latest",
+            "lic_env": "LICENSE_KEY_SSL", "port": 8008,
+            "env": {"SSL_VERSION": ("ENV", "SSL_VERSION"), "RESET_DATABASE": "false",
+                    "USESSE": "false"},
+            "binds": [(("PATH_BASES", "mcp_ssl"), "/app/zvec_db", "rw")]},
+    "templates": {"container": "1c_templates_mcp", "image": "comol/template-search-mcp:latest",
+                  "lic_env": "LICENSE_KEY_TEMPLATES", "port": 8004,
+                  "env": {"RESET_CACHE": "false", "RESET_DATABASE": "false",
+                          "USESSE": "false"},
+                  "binds": [(("PATH_BASES", "mcp_templates"), "/app/chroma_db", "rw")]},
+    "codemeta": {"container": "1c_code_metadata_mcp", "image": "comol/1c_code_metadata_mcp:latest",
+                 "lic_env": "LICENSE_KEY_CODEMETADATA", "port": 8000,
+                 "env": {"METADATA_PATH": "/app/code", "CODE_PATH": "/app/code",
+                         "SOURCE_FORMAT": "auto", "RESET_CACHE": "false",
+                         "RESET_DATABASE": "false", "USESSE": "false"},
+                 "binds": [("PATH_CODE", "/app/code", "ro"),
+                           (("PATH_BASES", "mcp_codemetadata"), "/app/chroma_db", "rw")]},
+}
+
+
+def resolve_bind(expr):
+    if isinstance(expr, tuple):
+        base, sub = expr
+        return f"{ENV(base, '')}/{sub}"
+    return ENV(expr, "")
+
+
+def recreate(key, use_gpu):
+    """Пересоздать контейнер сервера с GPU или без. Индексы живут в томах."""
+    spec = RUN_SPECS[key]
+    lic = ENV(spec["lic_env"], "")
+    if not lic:
+        return {"ok": False, "error": f"в окружении монитора нет {spec['lic_env']}"}
+    env = {"LICENSE_KEY": lic}
+    for k, v in spec["env"].items():
+        env[k] = ENV(v[1], "") if isinstance(v, tuple) else v
+    volumes, missing = {}, []
+    for src_expr, dst, mode in spec["binds"]:
+        # Пути Windows-хоста: внутри Linux-контейнера их не проверить,
+        # непустой строки достаточно — демон Docker сам сообщит об ошибке.
+        host = resolve_bind(src_expr).rstrip("/")
+        if not host:
+            missing.append(str(src_expr))
+            continue
+        volumes[host] = {"bind": dst, "mode": mode}
+    if missing:
+        return {"ok": False, "error": f"нет путей на хосте: {missing}"}
+    client = dclient()
+    try:
+        old = client.containers.get(spec["container"])
+        old.stop(timeout=30)
+        old.remove()
+    except docker.errors.NotFound:
+        pass
+    kwargs = {"image": spec["image"], "name": spec["container"], "detach": True,
+              "environment": env, "volumes": volumes,
+              "ports": {f"{spec['port']}/tcp": ("127.0.0.1", spec["port"])},
+              "restart_policy": {"Name": "unless-stopped"}}
+    if use_gpu:
+        from docker.types import DeviceRequest
+        kwargs["device_requests"] = [DeviceRequest(count=-1, capabilities=[["gpu"]])]
+    c = client.containers.run(**kwargs)
+    return {"ok": True, "id": c.short_id, "mode": "GPU" if use_gpu else "CPU"}
+
+
+def gpu_summary():
+    """VRAM и процессы через NVML. Нужен запуск монитора с --gpus all."""
+    try:
+        import pynvml as nv
+        nv.nvmlInit()
+        h = nv.nvmlDeviceGetHandleByIndex(0)
+        mem = nv.nvmlDeviceGetMemoryInfo(h)
+        try:
+            name = nv.nvmlDeviceGetName(h)
+            name = name.decode() if isinstance(name, bytes) else str(name)
+        except Exception:
+            name = "GPU-0"
+        procs = []
+        try:
+            for p in nv.nvmlDeviceGetComputeRunningProcesses(h):
+                try:
+                    pn = nv.nvmlSystemGetProcessName(p.pid)
+                    pn = pn.decode() if isinstance(pn, bytes) else str(pn)
+                except Exception:
+                    pn = "?"
+                procs.append({"pid": p.pid, "name": pn.split("/")[-1][:40],
+                              "mem_mb": round(p.usedGpuMemory / 1048576)})
+        except Exception:
+            pass
+        procs.sort(key=lambda x: -x["mem_mb"])
+        return {"available": True, "name": name,
+                "total_mb": round(mem.total / 1048576),
+                "used_mb": round(mem.used / 1048576),
+                "free_mb": round(mem.free / 1048576), "procs": procs[:20]}
+    except Exception as e:
+        return {"available": False,
+                "detail": str(e)[:200] + " (запустите монитор с --gpus all)"}
+
 
 def dclient():
     return docker.from_env()
@@ -69,6 +180,15 @@ def container_info(name):
         # Health имеет смысл только у запущенного контейнера; у остановленного
         # Docker показывает протухший статус последней проверки — скрываем его.
         health = (st.get("Health") or {}).get("Status") if st.get("Status") == "running" else None
+        # Флаг GPU: контейнер создан с device request на видеокарту.
+        gpu = False
+        try:
+            for d in (c.attrs.get("HostConfig", {}) or {}).get("DeviceRequests") or []:
+                caps = str(d.get("Capabilities", [])).lower()
+                if "gpu" in caps or (d.get("Count", 0) or 0) != 0:
+                    gpu = True
+        except Exception:
+            pass
         started = st.get("StartedAt", "")
         uptime = ""
         if st.get("Status") == "running" and started:
@@ -79,7 +199,7 @@ def container_info(name):
             except Exception:
                 pass
         return {"exists": True, "status": st.get("Status", "?"),
-                "health": health, "restarts": st.get("RestartCount", 0),
+                "health": health, "gpu": gpu, "restarts": st.get("RestartCount", 0),
                 "uptime": uptime, "image": (c.image.tags or ["?"])[0]}
     except Exception as e:
         return {"exists": True, "status": "error", "detail": str(e)[:120]}
@@ -182,8 +302,24 @@ def api_status():
         out.append({"key": s["key"], "name": s["name"], "port": s["port"],
                     "desc": s["desc"], "expected_tools": s["tools"],
                     "channel": s.get("channel", ""), "note": s.get("note", ""),
+                    "switchable": s["key"] in RUN_SPECS,
                     "state": state, "container": ci, "mcp": mcp, "progress": prog})
     return jsonify({"servers": out, "ts": int(time.time())})
+
+
+@app.get("/api/gpu")
+def api_gpu():
+    return jsonify(gpu_summary())
+
+
+@app.post("/api/mode/<key>/<which>")
+def api_mode(key, which):
+    if key not in RUN_SPECS or which not in ("gpu", "cpu"):
+        return jsonify({"ok": False, "error": "bad key/mode"}), 400
+    try:
+        return jsonify(recreate(key, which == "gpu"))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:300]}), 500
 
 
 @app.get("/api/logs/<name>")
@@ -237,6 +373,9 @@ pre#biglog{background:#0c1220;border:1px solid #2a3450;border-radius:8px;padding
 <h1>1C MCP — мониторинг флота</h1>
 <div class="sub">Docker + MCP-зонды + прогресс индексации из логов. Обновление каждые 5 с. <span id="ts"></span><br>
 <label><input type="checkbox" id="showdead"> показывать остановленные / legacy</label> <span id="hidden"></span></div>
+<h3>Видеокарта</h3>
+<div class="card" id="gpupanel">опрос NVML…</div>
+<h3>Серверы</h3>
 <div class="grid" id="grid"></div>
 <h3>Логи контейнера</h3>
 <div class="btns" id="logbtns"></div>
@@ -247,6 +386,7 @@ const showBox=document.getElementById('showdead'),hiddenBox=document.getElementB
 showBox.checked=localStorage.getItem('mcpmon_showdead')==='1';
 showBox.onchange=()=>{localStorage.setItem('mcpmon_showdead',showBox.checked?'1':'0');refresh();};
 async function refresh(){
+  gpuRefresh();
   const r=await fetch('/api/status');const j=await r.json();
   ts.textContent='обновлено '+new Date(j.ts*1000).toLocaleTimeString();
   const vis=j.servers.filter(s=>showBox.checked||!['stopped','missing'].includes(s.state));
@@ -262,9 +402,11 @@ async function refresh(){
     <div><span class="badge ${s.state}">${s.state}</span></div>
     <div class="row">Контейнер: <b>${c.status||'?'}</b>${c.health?' · health: <b>'+c.health+'</b>':''}${c.uptime?' · uptime '+c.uptime:''}${c.restarts?' · рестартов: <b>'+c.restarts+'</b>':''}</div>
     <div class="row">MCP: <b>${m.ok===true?'отвечает ('+m.ms+' мс)':(m.ok===false?'не отвечает':'—')}</b>${m.http?' · HTTP '+m.http:''} · лицензия: <b>${p.license}</b></div>
+    ${s.switchable?`<div class="row">Режим: <b>${c.gpu?'GPU':'CPU'}</b></div>`:''}
     <div class="row">Инструменты: ${tools}</div>${bar}
     ${p.line?`<div class="logline">${p.line.replace(/</g,'&lt;')}</div>`:''}
     <div class="btns"><button onclick="logs('${s.key}','${s.name}')">логи</button>
+    ${s.switchable?`<button onclick="mode('${s.key}','gpu')">на GPU</button><button onclick="mode('${s.key}','cpu')">на CPU</button>`:''}
     <button onclick="ctl('${s.key}','start')">start</button><button onclick="ctl('${s.key}','stop')">stop</button>
     <button onclick="ctl('${s.key}','restart')">restart</button></div></div>`}).join('');
   const lb=document.getElementById('logbtns');
@@ -274,10 +416,29 @@ const CNAME={help:'1c_help_mcp',graph:'1c_graph_metadata',codemeta:'1c_code_meta
 async function ctl(key,action){
   await fetch(`/api/control/${CNAME[key]}/${action}`,{method:'POST'});refresh();
 }
+async function mode(key,which){
+  if(!confirm(`Пересоздать сервер в режиме ${which.toUpperCase()}? Индексы сохранятся (тома), займёт ~1 мин.`))return;
+  const r=await fetch(`/api/mode/${key}/${which}`,{method:'POST'});
+  const j=await r.json();
+  if(!j.ok)alert('Ошибка: '+(j.error||'unknown'));
+  setTimeout(refresh,10000);
+}
 async function logs(key,title){
   const cname=CNAME[key]||key;
   const r=await fetch(`/api/logs/${cname}?tail=80`);
   document.getElementById('biglog').textContent='=== '+cname+' ===\\n'+await r.text();
+}
+async function gpuRefresh(){
+  const box=document.getElementById('gpupanel');
+  try{
+    const g=await (await fetch('/api/gpu')).json();
+    if(!g.available){box.innerHTML='NVML недоступен: '+(g.detail||'').replace(/</g,'&lt;');return;}
+    const pct=Math.round(g.used_mb*100/Math.max(g.total_mb,1));
+    const rows=(g.procs||[]).map(p=>`<div class="row">PID ${p.pid} · ${p.name.replace(/</g,'&lt;')} · <b>${p.mem_mb} МБ</b></div>`).join('')||'<div class="row">процессов на GPU нет</div>';
+    box.innerHTML=`<div class="row"><b>${g.name.replace(/</g,'&lt;')}</b> · занято <b>${g.used_mb}</b> / ${g.total_mb} МБ · свободно <b>${g.free_mb}</b> МБ</div>
+    <div class="bar"><i style="width:${pct}%"></i></div>${rows}
+    <div class="row">Контейнеры 1С с доступом к GPU помечены «Режим: GPU» на карточках. Переключение — кнопки «на GPU»/«на CPU» (пересоздание, индексы в томах сохраняются).</div>`;
+  }catch(e){box.innerHTML='ошибка опроса GPU';}
 }
 refresh();setInterval(refresh,5000);
 </script></body></html>"""
